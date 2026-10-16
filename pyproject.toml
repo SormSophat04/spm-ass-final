@@ -1,0 +1,20 @@
+[project]
+name = "academic-coordinator-api"
+version = "2.4.0"
+description = "Academic Lecture & Institutional Seminar Coordinator Backend API"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.115.0",
+    "fastapi[standard]>=0.115.0",
+    "uvicorn>=0.30.0",
+    "flask>=3.0.0",
+    "flask-cors>=4.0.0",
+    "SQLAlchemy>=2.0.0",
+    "psycopg2-binary>=2.9.0",
+    "python-dateutil>=2.8.0",
+    "fpdf2>=2.7.0",
+]
+
+[tool.fastapi]
+entrypoint = "main:app"

@@ -1,0 +1,30 @@
+# Python byte code
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.env
+.venv/
+env/
+venv/
+ENV/
+
+# FastAPI Cloud deployment artifacts
+.fastapicloud/
+
+# SQLite Databases
+data/*.db
+*.sqlite
+*.sqlite3
+!data/.gitkeep
+
+# Exported PDFs and Temporary Uploads
+exports/*.pdf
+!exports/.gitkeep
+uploads/*
+!uploads/.gitkeep
+
+# IDEs
+.vscode/
+.idea/
