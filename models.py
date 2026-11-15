@@ -16,6 +16,7 @@ class User(Base):
     role = Column(String(32), nullable=False, default="Student") # Dean, Professor, Teaching Assistant, Student, Auditor
     department = Column(String(128), default="Computer Science & Engineering")
     avatar_url = Column(String(256), nullable=True)
+    password_hash = Column(String(256), nullable=True)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 

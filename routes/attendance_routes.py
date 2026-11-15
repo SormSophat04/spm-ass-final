@@ -1,27 +1,37 @@
 import datetime
 import json
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, g, request, jsonify
+from sqlalchemy import func
 from database import db_session
 from models import (
     AttendanceRecord, LectureSession, Course, CourseEnrollment,
     User, SessionEntranceLog, AuditLog
 )
+from security import DEFAULT_DEMO_PASSWORD, hash_password, has_ta_scope, require_module, require_roles
 
 attendance_bp = Blueprint("attendance", __name__, url_prefix="/api/attendance")
 
 @attendance_bp.route("/session/<int:session_id>", methods=["GET"])
+@require_module("attendance")
 def get_session_attendance(session_id):
     """Retrieve full attendance sheet for a specific lecture session"""
     session = db_session.query(LectureSession).filter(LectureSession.id == session_id).first()
     if not session:
         return jsonify({"success": False, "message": "Session not found"}), 404
 
+    user = g.current_user
+    if user.role == "Teaching Assistant" and not has_ta_scope(user, session.course_id, "can_take_attendance"):
+        return jsonify({"success": False, "message": "Access Denied: TA lacks attendance scope for this course"}), 403
+
     # Enrolled students in course
-    enrollments = db_session.query(CourseEnrollment).filter(
+    enrollments_query = db_session.query(CourseEnrollment).filter(
         CourseEnrollment.course_id == session.course_id,
         CourseEnrollment.status == "active",
         CourseEnrollment.role_scope == "student"
-    ).all()
+    )
+    if user.role == "Student":
+        enrollments_query = enrollments_query.filter(CourseEnrollment.user_id == user.id)
+    enrollments = enrollments_query.all()
 
     existing_records = {
         r.student_id: r for r in db_session.query(AttendanceRecord).filter(
@@ -45,7 +55,7 @@ def get_session_attendance(session_id):
         if rec:
             rec_dict = rec.to_dict()
             effective_status = rec.verified_status if rec.verified_status not in ["pending", None] else rec.automated_status
-            if effective_status == "present":
+            if effective_status in ["present", "override_approved"]:
                 present_count += 1
             elif effective_status == "late":
                 late_count += 1
@@ -83,11 +93,22 @@ def get_session_attendance(session_id):
     total_enrolled = len(enrollments)
     attendance_rate = round(((present_count + late_count) / max(1, total_enrolled)) * 100, 1)
 
+    sec_cfg = {}
+    if session.room_security_config:
+        try:
+            sec_cfg = json.loads(session.room_security_config)
+        except Exception:
+            sec_cfg = {}
+
     return jsonify({
         "success": True,
         "session_id": session.id,
         "session_title": session.title,
+        "course_id": session.course_id,
         "course_code": session.course.code if session.course else None,
+        "course_title": session.course.title if session.course else None,
+        "virtual_room_code": session.virtual_room_code,
+        "room_security_config": sec_cfg,
         "status": session.status,
         "metrics": {
             "total_enrolled": total_enrolled,
@@ -102,22 +123,32 @@ def get_session_attendance(session_id):
     })
 
 @attendance_bp.route("/join-gate", methods=["POST"])
+@require_module("attendance")
 def join_lecture_gate():
     """Module 2: Auto-Track Connection Duration & Detect Late Arrivals at Virtual Room Gate"""
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     session_id = data.get("session_id")
-    student_id = data.get("student_id")
+    student_id = data.get("student_id") or (g.current_user.id if g.current_user.role == "Student" else None)
     ip_address = request.remote_addr or data.get("ip_address", "127.0.0.1")
     user_agent = request.headers.get("User-Agent", "Mozilla/5.0")
 
     if not session_id or not student_id:
         return jsonify({"success": False, "message": "session_id and student_id required"}), 400
 
+    if g.current_user.role == "Student" and int(student_id) != g.current_user.id:
+        return jsonify({"success": False, "message": "Access Denied: Students can only enter the gate for themselves"}), 403
+
     session = db_session.query(LectureSession).filter(LectureSession.id == session_id).first()
     student = db_session.query(User).filter(User.id == student_id).first()
 
     if not session or not student:
         return jsonify({"success": False, "message": "Session or Student not found"}), 404
+
+    if g.current_user.role == "Teaching Assistant" and not has_ta_scope(g.current_user, session.course_id, "can_take_attendance"):
+        return jsonify({"success": False, "message": "Access Denied: TA lacks attendance scope for this course"}), 403
+
+    if session.status in ("completed", "cancelled"):
+        return jsonify({"success": False, "admitted": False, "message": f"Gate Closed: Session is already {session.status}."}), 403
 
     # Gate Security Check (Module 1 & 2 integration)
     sec_cfg = {}
@@ -126,6 +157,23 @@ def join_lecture_gate():
             sec_cfg = json.loads(session.room_security_config)
         except Exception:
             pass
+
+    if sec_cfg.get("lock_gate", False):
+        log = SessionEntranceLog(
+            session_id=session_id,
+            user_id=student_id,
+            event_type="gate_rejected",
+            ip_address=ip_address,
+            user_agent=user_agent,
+            details="Access denied: Virtual classroom gate is locked."
+        )
+        db_session.add(log)
+        db_session.commit()
+        return jsonify({
+            "success": False,
+            "admitted": False,
+            "message": "Gate Rejected: Virtual classroom gate is currently locked."
+        }), 403
 
     # Restrict to enrolled
     if sec_cfg.get("restrict_to_enrolled", True):
@@ -157,7 +205,7 @@ def join_lecture_gate():
     # Calculate Late Arrival against session scheduled start or actual start
     grace_period_mins = sec_cfg.get("grace_period_mins", 10)
     session_start_ref = session.actual_start or session.scheduled_start
-    elapsed_start_mins = (now - session_start_ref).total_seconds() / 60.0
+    elapsed_start_mins = max(0.0, (now - session_start_ref).total_seconds() / 60.0)
     
     is_late = False
     late_minutes = 0.0
@@ -218,12 +266,18 @@ def join_lecture_gate():
     })
 
 @attendance_bp.route("/heartbeat", methods=["POST"])
+@require_module("attendance")
 def attendance_heartbeat():
     """Module 2: Auto-Track Connection Duration (updates connection duration periodically)"""
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     session_id = data.get("session_id")
-    student_id = data.get("student_id")
-    increment_seconds = data.get("increment_seconds", 30)
+    student_id = data.get("student_id") or (g.current_user.id if g.current_user.role == "Student" else None)
+    if g.current_user.role == "Student" and student_id and int(student_id) != g.current_user.id:
+        return jsonify({"success": False, "message": "Access Denied: Cannot record heartbeat for another student"}), 403
+    try:
+        increment_seconds = max(0.0, float(data.get("increment_seconds", 30)))
+    except (TypeError, ValueError):
+        increment_seconds = 30.0
 
     rec = db_session.query(AttendanceRecord).filter(
         AttendanceRecord.session_id == session_id,
@@ -232,12 +286,15 @@ def attendance_heartbeat():
 
     if rec:
         session = db_session.query(LectureSession).filter(LectureSession.id == session_id).first()
-        rec.total_duration_minutes = round(rec.total_duration_minutes + (increment_seconds / 60.0), 1)
+        rec.total_duration_minutes = round((rec.total_duration_minutes or 0.0) + (increment_seconds / 60.0), 1)
         
         # Calculate coverage against scheduled duration
         if session:
             sched_mins = max(1.0, (session.scheduled_end - session.scheduled_start).total_seconds() / 60.0)
             rec.lecture_coverage_pct = min(100.0, round((rec.total_duration_minutes / sched_mins) * 100.0, 1))
+            if not rec.is_late and rec.lecture_coverage_pct >= 75.0:
+                rec.automated_status = "present"
+                rec.registrar_compliance_flag = True
 
         db_session.commit()
         return jsonify({"success": True, "total_duration_minutes": rec.total_duration_minutes, "coverage_pct": rec.lecture_coverage_pct})
@@ -245,11 +302,14 @@ def attendance_heartbeat():
     return jsonify({"success": False, "message": "Attendance record not found"}), 404
 
 @attendance_bp.route("/leave-gate", methods=["POST"])
+@require_module("attendance")
 def leave_lecture_gate():
     """Module 2: Flag Early Disconnections when student drops off before lecture dismissal"""
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     session_id = data.get("session_id")
-    student_id = data.get("student_id")
+    student_id = data.get("student_id") or (g.current_user.id if g.current_user.role == "Student" else None)
+    if g.current_user.role == "Student" and student_id and int(student_id) != g.current_user.id:
+        return jsonify({"success": False, "message": "Access Denied: Cannot disconnect another student"}), 403
     reason = data.get("reason", "normal_disconnect")
 
     rec = db_session.query(AttendanceRecord).filter(
@@ -295,23 +355,58 @@ def leave_lecture_gate():
     })
 
 @attendance_bp.route("/override", methods=["PUT"])
+@require_roles("Dean", "Professor", "Teaching Assistant")
 def override_verified_status():
     """Module 2: Update Verified Status & Reconcile automated attendance with professor manual overrides"""
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     record_id = data.get("record_id")
+    session_id = data.get("session_id")
+    student_id = data.get("student_id")
     verified_status = data.get("verified_status") # present, late, partial, excused, absent, override_approved
-    verification_reason = data.get("verification_reason", "").strip()
-    actor_id = data.get("actor_id", 2)
+    verification_reason = (data.get("verification_reason") or "").strip()
+    actor_id = g.current_user.id
 
-    if not record_id or not verified_status:
-        return jsonify({"success": False, "message": "record_id and verified_status required"}), 400
+    allowed_statuses = {"present", "late", "partial", "excused", "absent", "override_approved"}
+    if not verified_status or (not record_id and not (session_id and student_id)):
+        return jsonify({"success": False, "message": "record_id (or session_id + student_id) and verified_status required"}), 400
+    if verified_status not in allowed_statuses:
+        return jsonify({"success": False, "message": f"Invalid verified_status '{verified_status}'"}), 400
 
     if not verification_reason:
         return jsonify({"success": False, "message": "Academic justification log is required for attendance override."}), 400
 
-    rec = db_session.query(AttendanceRecord).filter(AttendanceRecord.id == record_id).first()
+    rec = None
+    if record_id:
+        rec = db_session.query(AttendanceRecord).filter(AttendanceRecord.id == record_id).first()
+    elif session_id and student_id:
+        rec = db_session.query(AttendanceRecord).filter(
+            AttendanceRecord.session_id == session_id,
+            AttendanceRecord.student_id == student_id
+        ).first()
+        if not rec:
+            sess = db_session.query(LectureSession).filter(LectureSession.id == session_id).first()
+            stu = db_session.query(User).filter(User.id == student_id).first()
+            if not sess or not stu:
+                return jsonify({"success": False, "message": "Session or student not found"}), 404
+            rec = AttendanceRecord(
+                session_id=session_id,
+                student_id=student_id,
+                total_duration_minutes=0.0,
+                lecture_coverage_pct=100.0 if verified_status in ("present", "override_approved") else 0.0,
+                automated_status="absent",
+                verified_status="pending",
+                registrar_compliance_flag=verified_status in ["present", "late", "excused", "override_approved"]
+            )
+            db_session.add(rec)
+            db_session.flush()
+
     if not rec:
         return jsonify({"success": False, "message": "Attendance record not found"}), 404
+
+    if g.current_user.role == "Teaching Assistant":
+        course_id = rec.session.course_id if rec.session else None
+        if not course_id or not has_ta_scope(g.current_user, course_id, "can_take_attendance"):
+            return jsonify({"success": False, "message": "Access Denied: TA lacks attendance override permission for this course"}), 403
 
     actor = db_session.query(User).filter(User.id == actor_id).first()
     prev_status = rec.verified_status or rec.automated_status
@@ -346,11 +441,12 @@ def override_verified_status():
     })
 
 @attendance_bp.route("/courses/<int:course_id>/roster-enroll", methods=["POST"])
+@require_roles("Dean", "Professor")
 def enroll_student_roster(course_id):
     """Module 2: Enroll Student Roster from campus Student Information System (SIS)"""
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     students_input = data.get("students", []) # list of dicts: [{institutional_id, name, email}]
-    actor_id = data.get("actor_id", 1)
+    actor_id = g.current_user.id
 
     course = db_session.query(Course).filter(Course.id == course_id).first()
     if not course:
@@ -360,16 +456,19 @@ def enroll_student_roster(course_id):
     created_users = 0
 
     for s in students_input:
-        inst_id = s.get("institutional_id", "").strip()
-        name = s.get("name", "").strip()
-        email = s.get("email", "").strip()
+        inst_id = (s.get("institutional_id") or "").strip()
+        name = (s.get("name") or "").strip()
+        email = (s.get("email") or "").strip()
 
         if not inst_id or not name:
             continue
 
-        user = db_session.query(User).filter(
-            (User.institutional_id == inst_id) | (User.email == email)
-        ).first()
+        if email:
+            user = db_session.query(User).filter(
+                (User.institutional_id == inst_id) | (func.lower(User.email) == email.lower())
+            ).first()
+        else:
+            user = db_session.query(User).filter(User.institutional_id == inst_id).first()
 
         if not user:
             user = User(
@@ -377,7 +476,8 @@ def enroll_student_roster(course_id):
                 name=name,
                 email=email or f"{inst_id.lower()}@student.university.edu",
                 role="Student",
-                department=course.department
+                department=course.department,
+                password_hash=hash_password(DEFAULT_DEMO_PASSWORD)
             )
             db_session.add(user)
             db_session.flush()
@@ -397,6 +497,11 @@ def enroll_student_roster(course_id):
                 status="active"
             )
             db_session.add(new_enr)
+            enrolled_count += 1
+        elif existing_enr.status != "active":
+            existing_enr.status = "active"
+            existing_enr.revoked_at = None
+            existing_enr.revocation_reason = None
             enrolled_count += 1
 
     actor = db_session.query(User).filter(User.id == actor_id).first()
@@ -420,21 +525,29 @@ def enroll_student_roster(course_id):
     })
 
 @attendance_bp.route("/courses/<int:course_id>/attendance-sheet", methods=["GET"])
+@require_module("attendance")
 def get_course_attendance_sheet(course_id):
     """Module 2: Generate Academic Attendance Sheet for university registrar compliance"""
     course = db_session.query(Course).filter(Course.id == course_id).first()
     if not course:
         return jsonify({"success": False, "message": "Course not found"}), 404
 
+    user = g.current_user
+    if user.role == "Teaching Assistant" and not has_ta_scope(user, course_id, "can_take_attendance"):
+        return jsonify({"success": False, "message": "Access Denied: TA lacks attendance permission for this course"}), 403
+
     sessions = db_session.query(LectureSession).filter(
         LectureSession.course_id == course_id
     ).order_by(LectureSession.scheduled_start).all()
 
-    enrollments = db_session.query(CourseEnrollment).filter(
+    enrollments_query = db_session.query(CourseEnrollment).filter(
         CourseEnrollment.course_id == course_id,
         CourseEnrollment.status == "active",
         CourseEnrollment.role_scope == "student"
-    ).all()
+    )
+    if user.role == "Student":
+        enrollments_query = enrollments_query.filter(CourseEnrollment.user_id == user.id)
+    enrollments = enrollments_query.all()
 
     matrix = []
     for enr in enrollments:

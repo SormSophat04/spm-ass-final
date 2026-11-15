@@ -6,17 +6,19 @@ from models import (
     AuditLog, SessionEntranceLog, AttendanceRecord, LectureSession,
     Course, User
 )
+from security import require_roles
 
 audit_bp = Blueprint("audit", __name__, url_prefix="/api/audit")
 
 @audit_bp.route("/logs", methods=["GET"])
+@require_roles("Dean", "Professor", "Auditor")
 def search_academic_logs():
     """Module 7: Search Academic Log Records - Filters by course, event type, actor, date range"""
     course_id = request.args.get("course_id", type=int)
     event_type = request.args.get("event_type")
     actor_id = request.args.get("actor_id", type=int)
     target_entity = request.args.get("target_entity")
-    search_query = request.args.get("q", "").strip().lower()
+    search_query = (request.args.get("q") or "").strip().lower()
 
     query = db_session.query(AuditLog)
     if course_id:
@@ -34,8 +36,10 @@ def search_academic_logs():
     if search_query:
         logs = [
             l for l in logs if (
-                search_query in l.actor_name.lower() or
-                search_query in l.event_type.lower() or
+                (l.actor_name and search_query in l.actor_name.lower()) or
+                (l.actor_role and search_query in l.actor_role.lower()) or
+                (l.event_type and search_query in l.event_type.lower()) or
+                (l.course and l.course.code and search_query in l.course.code.lower()) or
                 (l.justification and search_query in l.justification.lower())
             )
         ]
@@ -47,6 +51,7 @@ def search_academic_logs():
     })
 
 @audit_bp.route("/entrance-logs", methods=["GET"])
+@require_roles("Dean", "Professor", "Auditor")
 def get_entrance_logs():
     """Module 7: Record & Search Session Entrance Logs (login times, IP addresses, disconnection reasons)"""
     session_id = request.args.get("session_id", type=int)
@@ -70,6 +75,7 @@ def get_entrance_logs():
     })
 
 @audit_bp.route("/compliance-report", methods=["GET"])
+@require_roles("Dean", "Professor", "Auditor")
 def export_compliance_audit_trail():
     """Module 7: Export Compliance Audit Trail (Produces accreditation-ready reports of student contact hours and faculty activity)"""
     course_id = request.args.get("course_id", type=int)
@@ -80,6 +86,10 @@ def export_compliance_audit_trail():
     courses = courses_query.all()
 
     report_data = []
+    agg_contact_hours = 0.0
+    agg_overrides = 0
+    agg_grade_adj = 0
+    agg_rejections = 0
 
     for c in courses:
         sessions = db_session.query(LectureSession).filter(LectureSession.course_id == c.id).all()
@@ -109,6 +119,15 @@ def export_compliance_audit_trail():
             SessionEntranceLog.event_type == "gate_rejected"
         ).count() if session_ids else 0
 
+        course_logs = db_session.query(AuditLog).filter(AuditLog.course_id == c.id).all()
+        justified_logs = len([l for l in course_logs if l.justification and l.justification.strip()])
+        integrity_pct = round((justified_logs / len(course_logs)) * 100.0, 1) if course_logs else 100.0
+
+        agg_contact_hours += total_contact_hours
+        agg_overrides += overrides_count
+        agg_grade_adj += grade_adjustments_count
+        agg_rejections += security_events_count
+
         report_data.append({
             "course_id": c.id,
             "course_code": c.code,
@@ -122,13 +141,28 @@ def export_compliance_audit_trail():
                 "attendance_overrides_logged": overrides_count,
                 "gradebook_synchronizations": grade_adjustments_count,
                 "unauthorized_gate_rejections": security_events_count,
-                "overall_institutional_integrity_index": "99.4%"
+                "overall_institutional_integrity_index": f"{integrity_pct}%"
             }
         })
+
+    all_logs = db_session.query(AuditLog).all()
+    all_justified = len([l for l in all_logs if l.justification and l.justification.strip()])
+    global_integrity_pct = round((all_justified / len(all_logs)) * 100.0, 1) if all_logs else 100.0
 
     return jsonify({
         "success": True,
         "generated_at": datetime.datetime.utcnow().isoformat(),
         "institution": "University Accreditation & Quality Assurance Board",
+        "overall_institutional_integrity_index": global_integrity_pct,
+        "totals": {
+            "total_contact_hours": round(agg_contact_hours, 1),
+            "total_student_contact_hours": round(agg_contact_hours, 1),
+            "total_attendance_overrides": agg_overrides,
+            "attendance_overrides_logged": agg_overrides,
+            "total_grade_adjustments": agg_grade_adj,
+            "gradebook_synchronizations": agg_grade_adj,
+            "total_gate_rejections": agg_rejections,
+            "integrity_index_pct": f"{global_integrity_pct}%"
+        },
         "compliance_summary": report_data
     })

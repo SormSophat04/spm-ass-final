@@ -1,6 +1,7 @@
 import datetime
 import json
 from database import db_session, init_db, engine, Base
+from security import DEFAULT_DEMO_PASSWORD, hash_password
 from models import (
     User, Course, SyllabusModule, CourseEnrollment, TAPermissionScope,
     RecurringTimetable, LectureSession, SessionCoHost, AttendanceRecord,
@@ -42,6 +43,7 @@ def seed_database():
     ]
 
     for u in users_data:
+        u.password_hash = hash_password(DEFAULT_DEMO_PASSWORD)
         db_session.add(u)
     db_session.commit()
 
@@ -638,6 +640,17 @@ def seed_database():
     print(f"Courses: 2 ({course_cs401.code}, {course_ai502.code})")
     print(f"Sessions: 4 (1 completed, 1 in-progress, 2 scheduled)")
     print("MOM Notes, Attendance Records, Quizzes, Leaves, and Audit Logs primed.")
+
+
+def ensure_seeded():
+    """Initialize tables and seed initial academic dataset only if users table is empty."""
+    init_db()
+    try:
+        if db_session.query(User).count() == 0:
+            seed_database()
+    finally:
+        db_session.remove()
+
 
 if __name__ == "__main__":
     seed_database()

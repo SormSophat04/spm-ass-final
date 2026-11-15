@@ -23,4 +23,24 @@ Base.query = db_session.query_property()
 
 def init_db():
     import models  # Ensure all models are registered
+    from sqlalchemy import inspect, text
+    from werkzeug.security import generate_password_hash
+
     Base.metadata.create_all(bind=engine)
+
+    # Lightweight schema backfill for existing SQLite databases created prior to password_hash
+    inspector = inspect(engine)
+    if "users" in inspector.get_table_names():
+        columns = {col["name"] for col in inspector.get_columns("users")}
+        if "password_hash" not in columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE users ADD COLUMN password_hash VARCHAR(256)"))
+
+        users_missing_pw = db_session.query(models.User).filter(
+            (models.User.password_hash == None) | (models.User.password_hash == "")
+        ).all()
+        if users_missing_pw:
+            default_hash = generate_password_hash("Academic@2026")
+            for u in users_missing_pw:
+                u.password_hash = default_hash
+            db_session.commit()

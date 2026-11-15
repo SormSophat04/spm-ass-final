@@ -1,22 +1,29 @@
 import datetime
 import json
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, g, request, jsonify
 from database import db_session
 from models import (
     LeaveRequest, AttendanceRecord, Course, LectureSession,
     User, CourseEnrollment, AuditLog
 )
+from security import require_module, require_roles
 
 leave_bp = Blueprint("leaves", __name__, url_prefix="/api/leaves")
 
 @leave_bp.route("", methods=["GET"])
+@require_module("leaves")
 def get_leave_requests():
     student_id = request.args.get("student_id", type=int)
     course_id = request.args.get("course_id", type=int)
     status = request.args.get("status")
 
     query = db_session.query(LeaveRequest)
-    if student_id:
+    if g.current_user.role == "Student":
+        query = query.filter(
+            (LeaveRequest.student_id == g.current_user.id) |
+            (LeaveRequest.note_proxy_id == g.current_user.id)
+        )
+    elif student_id:
         query = query.filter(LeaveRequest.student_id == student_id)
     if course_id:
         query = query.filter(LeaveRequest.course_id == course_id)
@@ -31,29 +38,55 @@ def get_leave_requests():
     })
 
 @leave_bp.route("", methods=["POST"])
+@require_module("leaves")
 def submit_leave_request():
     """Module 3: Submit Leave Request with category tags and official documentation"""
-    data = request.get_json() or {}
-    student_id = data.get("student_id")
+    data = request.get_json(silent=True) or {}
+    student_id = data.get("student_id") or (g.current_user.id if g.current_user.role == "Student" else None)
+    if g.current_user.role == "Student" and student_id and int(student_id) != g.current_user.id:
+        return jsonify({"success": False, "message": "Access Denied: Students can only submit leave requests for themselves"}), 403
     course_id = data.get("course_id")
     session_id = data.get("session_id")
     category = data.get("category", "medical") # medical, university_competition, academic_conference, bereavement, emergency
     start_date_str = data.get("start_date")
     end_date_str = data.get("end_date")
-    reason = data.get("reason", "").strip()
-    document_filename = data.get("document_filename")
-    document_url = data.get("document_url", "/uploads/sample_medical_doc.pdf")
+    reason = (data.get("reason") or "").strip()
+    document_filename = (data.get("document_filename") or "Official_Document_Attachment.pdf").strip()
+    document_url = (data.get("document_url") or f"/uploads/{document_filename}").strip()
     document_type = data.get("document_type", "application/pdf")
     note_proxy_id = data.get("note_proxy_id")
 
     if not student_id or not course_id or not start_date_str or not end_date_str or not reason:
         return jsonify({"success": False, "message": "Missing required leave submission fields"}), 400
 
+    student = db_session.query(User).filter(User.id == student_id).first()
+    if not student:
+        return jsonify({"success": False, "message": "Student not found"}), 404
+
+    course = db_session.query(Course).filter(Course.id == course_id).first()
+    if not course:
+        return jsonify({"success": False, "message": "Course not found"}), 404
+
+    if session_id:
+        session = db_session.query(LectureSession).filter(LectureSession.id == session_id).first()
+        if not session:
+            return jsonify({"success": False, "message": "Lecture session not found"}), 404
+
     try:
         start_date = datetime.datetime.fromisoformat(start_date_str.replace("Z", "+00:00")).replace(tzinfo=None)
         end_date = datetime.datetime.fromisoformat(end_date_str.replace("Z", "+00:00")).replace(tzinfo=None)
     except Exception as e:
         return jsonify({"success": False, "message": f"Invalid date format: {str(e)}"}), 400
+
+    if end_date < start_date:
+        return jsonify({"success": False, "message": "end_date cannot be earlier than start_date"}), 400
+
+    if note_proxy_id:
+        if int(note_proxy_id) == int(student_id):
+            return jsonify({"success": False, "message": "Student cannot be assigned as their own note proxy"}), 400
+        proxy_user = db_session.query(User).filter(User.id == note_proxy_id).first()
+        if not proxy_user:
+            return jsonify({"success": False, "message": "Designated note proxy user not found"}), 404
 
     new_leave = LeaveRequest(
         student_id=student_id,
@@ -73,13 +106,10 @@ def submit_leave_request():
     db_session.add(new_leave)
     db_session.commit()
 
-    student = db_session.query(User).filter(User.id == student_id).first()
-    course = db_session.query(Course).filter(Course.id == course_id).first()
-
     audit = AuditLog(
         actor_id=student_id,
-        actor_name=student.name if student else "Student",
-        actor_role="Student",
+        actor_name=student.name,
+        actor_role=student.role,
         event_type="leave_request_submitted",
         target_entity="LeaveRequest",
         target_id=new_leave.id,
@@ -97,12 +127,13 @@ def submit_leave_request():
     }), 201
 
 @leave_bp.route("/<int:leave_id>/review", methods=["PUT"])
+@require_roles("Dean", "Professor")
 def review_leave_request(leave_id):
     """Module 3: Approve/Reject Absence & Automatically reconcile attendance to excused"""
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     status = data.get("status") # "approved" or "rejected"
-    review_comment = data.get("review_comment", "").strip()
-    reviewer_id = data.get("reviewer_id", 2) # Faculty / Advisor ID
+    review_comment = (data.get("review_comment") or "").strip()
+    reviewer_id = g.current_user.id
 
     if status not in ["approved", "rejected"]:
         return jsonify({"success": False, "message": "Status must be 'approved' or 'rejected'"}), 400
@@ -113,6 +144,7 @@ def review_leave_request(leave_id):
 
     reviewer = db_session.query(User).filter(User.id == reviewer_id).first()
     now = datetime.datetime.utcnow()
+    prev_status = leave.status
 
     leave.status = status
     leave.reviewed_by_id = reviewer_id
@@ -127,10 +159,10 @@ def review_leave_request(leave_id):
             if s:
                 target_sessions.append(s)
         else:
-            # All sessions in course falling within the start_date and end_date window
+            # All sessions in course overlapping the start_date and end_date window
             target_sessions = db_session.query(LectureSession).filter(
                 LectureSession.course_id == leave.course_id,
-                LectureSession.scheduled_start >= leave.start_date,
+                LectureSession.scheduled_end >= leave.start_date,
                 LectureSession.scheduled_start <= leave.end_date
             ).all()
 
@@ -169,7 +201,7 @@ def review_leave_request(leave_id):
         target_entity="LeaveRequest",
         target_id=leave.id,
         course_id=leave.course_id,
-        change_before=json.dumps({"status": "pending"}),
+        change_before=json.dumps({"status": prev_status}),
         change_after=json.dumps({"status": status, "comment": review_comment}),
         justification=f"Formal validation: leave request {status.upper()} with justification."
     )
@@ -183,9 +215,10 @@ def review_leave_request(leave_id):
     })
 
 @leave_bp.route("/<int:leave_id>/assign-proxy", methods=["POST"])
+@require_roles("Dean", "Professor")
 def assign_note_proxy(leave_id):
     """Module 3: Assign Note Proxy - Pairs absent students with designated note-takers"""
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     note_proxy_id = data.get("note_proxy_id")
 
     if not note_proxy_id:
@@ -194,6 +227,9 @@ def assign_note_proxy(leave_id):
     leave = db_session.query(LeaveRequest).filter(LeaveRequest.id == leave_id).first()
     if not leave:
         return jsonify({"success": False, "message": "Leave request not found"}), 404
+
+    if int(note_proxy_id) == int(leave.student_id):
+        return jsonify({"success": False, "message": "Cannot assign the absent student as their own note proxy"}), 400
 
     proxy_user = db_session.query(User).filter(User.id == note_proxy_id).first()
     if not proxy_user:
@@ -208,9 +244,49 @@ def assign_note_proxy(leave_id):
         "leave": leave.to_dict()
     })
 
+
+@leave_bp.route("/<int:leave_id>/deliver-proxy-notes", methods=["PUT"])
+@require_module("leaves")
+def deliver_proxy_notes(leave_id):
+    """Mark peer note-proxy study summary as delivered to the absent student."""
+    leave = db_session.query(LeaveRequest).filter(LeaveRequest.id == leave_id).first()
+    if not leave:
+        return jsonify({"success": False, "message": "Leave request not found"}), 404
+
+    user = g.current_user
+    if user.role == "Student" and user.id not in (leave.note_proxy_id, leave.student_id):
+        return jsonify({"success": False, "message": "Only the designated note proxy or faculty can confirm note delivery"}), 403
+
+    data = request.get_json(silent=True) or {}
+    delivered = bool(data.get("delivered", True))
+    leave.proxy_notes_delivered = delivered
+
+    audit = AuditLog(
+        actor_id=user.id,
+        actor_name=user.name,
+        actor_role=user.role,
+        event_type="proxy_notes_delivered",
+        target_entity="LeaveRequest",
+        target_id=leave.id,
+        course_id=leave.course_id,
+        change_after=json.dumps({"proxy_notes_delivered": delivered}),
+        justification=f"Peer note proxy study notes marked as {'delivered' if delivered else 'pending'} for leave #{leave.id}."
+    )
+    db_session.add(audit)
+    db_session.commit()
+
+    return jsonify({
+        "success": True,
+        "message": "Proxy study notes delivery status updated",
+        "leave": leave.to_dict()
+    })
+
 @leave_bp.route("/student/<int:student_id>/history", methods=["GET"])
+@require_module("leaves")
 def get_student_leave_history(student_id):
     """Module 3: View Student Leave History & Displays cumulative absence records with threshold warnings"""
+    if g.current_user.role == "Student" and student_id != g.current_user.id:
+        return jsonify({"success": False, "message": "Access Denied: Cannot view another student's leave history"}), 403
     student = db_session.query(User).filter(User.id == student_id).first()
     if not student:
         return jsonify({"success": False, "message": "Student not found"}), 404
