@@ -28,13 +28,18 @@ def init_db():
 
     Base.metadata.create_all(bind=engine)
 
-    # Lightweight schema backfill for existing SQLite databases created prior to password_hash
+    # Lightweight schema backfill for existing databases created prior to auth/OTP columns
     inspector = inspect(engine)
     if "users" in inspector.get_table_names():
         columns = {col["name"] for col in inspector.get_columns("users")}
-        if "password_hash" not in columns:
-            with engine.begin() as conn:
+        with engine.begin() as conn:
+            if "password_hash" not in columns:
                 conn.execute(text("ALTER TABLE users ADD COLUMN password_hash VARCHAR(256)"))
+            if "email_verified" not in columns:
+                default_bool = "0" if engine.dialect.name == "sqlite" else "FALSE"
+                conn.execute(text(f"ALTER TABLE users ADD COLUMN email_verified BOOLEAN DEFAULT {default_bool}"))
+            if "auth_source" not in columns:
+                conn.execute(text("ALTER TABLE users ADD COLUMN auth_source VARCHAR(32) DEFAULT 'institutional'"))
 
         users_missing_pw = db_session.query(models.User).filter(
             (models.User.password_hash == None) | (models.User.password_hash == "")

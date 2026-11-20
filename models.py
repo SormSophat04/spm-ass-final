@@ -17,6 +17,8 @@ class User(Base):
     department = Column(String(128), default="Computer Science & Engineering")
     avatar_url = Column(String(256), nullable=True)
     password_hash = Column(String(256), nullable=True)
+    email_verified = Column(Boolean, default=False)
+    auth_source = Column(String(32), default="institutional") # institutional, email_otp
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
@@ -37,9 +39,27 @@ class User(Base):
             "role": self.role,
             "department": self.department,
             "avatar_url": self.avatar_url,
+            "email_verified": bool(self.email_verified),
+            "auth_source": self.auth_source or "institutional",
             "is_active": self.is_active,
             "created_at": self.created_at.isoformat() if self.created_at else None
         }
+
+
+class EmailOTP(Base):
+    __tablename__ = "email_otps"
+
+    id = Column(Integer, primary_key=True)
+    email = Column(String(128), nullable=False, index=True)
+    code_hash = Column(String(128), nullable=False)
+    purpose = Column(String(32), default="login", nullable=False)
+    attempts = Column(Integer, default=0, nullable=False)
+    max_attempts = Column(Integer, default=5, nullable=False)
+    is_used = Column(Boolean, default=False, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    used_at = Column(DateTime, nullable=True)
+    ip_address = Column(String(64), default="127.0.0.1")
 
 
 class Course(Base):

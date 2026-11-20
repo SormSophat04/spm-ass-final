@@ -2,6 +2,7 @@ import base64
 import hashlib
 import hmac
 import json
+import secrets
 import time
 from functools import wraps
 from flask import g, jsonify, request
@@ -85,6 +86,29 @@ def verify_password(pw_hash: str, password: str) -> bool:
     if not pw_hash or not password:
         return False
     return check_password_hash(pw_hash, password)
+
+
+def generate_otp_code(length: int = 6) -> str:
+    """Generate a cryptographically secure numeric OTP code of the requested length."""
+    digits = max(4, min(int(length), 8))
+    return f"{secrets.randbelow(10 ** digits):0{digits}d}"
+
+
+def hash_otp_code(email: str, otp_code: str) -> str:
+    """Compute a keyed HMAC-SHA256 digest for an email + OTP pair."""
+    normalized = f"otp:{email.strip().lower()}:{otp_code.strip()}".encode("utf-8")
+    return hmac.new(
+        Config.SECRET_KEY.encode("utf-8"),
+        normalized,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def verify_otp_hash(email: str, otp_code: str, expected_hash: str) -> bool:
+    if not email or not otp_code or not expected_hash:
+        return False
+    candidate = hash_otp_code(email, otp_code)
+    return hmac.compare_digest(candidate, expected_hash)
 
 
 def _b64url_encode(data: bytes) -> str:
