@@ -1,19 +1,33 @@
+import importlib.util
 from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session
 from config import Config
 
-# Handle postgresql:// vs postgresql+psycopg2:// if needed
+# Normalize PostgreSQL URLs and pick an installed driver (SQLAlchemy 2.1 defaults
+# bare postgresql:// to psycopg v3, whereas older setups may only have psycopg2).
 db_url = Config.DATABASE_URL
 if db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql://", 1)
 
-# SQLite multi-threaded support
+has_psycopg = importlib.util.find_spec("psycopg") is not None
+has_psycopg2 = importlib.util.find_spec("psycopg2") is not None
+
+if db_url.startswith("postgresql://"):
+    if not has_psycopg and has_psycopg2:
+        db_url = db_url.replace("postgresql://", "postgresql+psycopg2://", 1)
+elif db_url.startswith("postgresql+psycopg://") and not has_psycopg and has_psycopg2:
+    db_url = db_url.replace("postgresql+psycopg://", "postgresql+psycopg2://", 1)
+elif db_url.startswith("postgresql+psycopg2://") and not has_psycopg2 and has_psycopg:
+    db_url = db_url.replace("postgresql+psycopg2://", "postgresql+psycopg://", 1)
+
+# SQLite multi-threaded support vs PostgreSQL pooling
 engine_args = {}
 if db_url.startswith("sqlite"):
     engine_args["connect_args"] = {"check_same_thread": False}
 else:
     engine_args["pool_size"] = 10
     engine_args["max_overflow"] = 20
+    engine_args["pool_pre_ping"] = True
 
 engine = create_engine(db_url, **engine_args)
 db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
